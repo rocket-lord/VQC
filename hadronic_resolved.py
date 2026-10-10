@@ -694,7 +694,7 @@ with torch.no_grad():
 with torch.no_grad():
     logits_train = model(Xtr_t)
     scores_mlp_train = torch.sigmoid(logits_train).numpy().flatten()
-#%%
+'''#%%
 # ==========================================
 # PENNYLANE VQC WITH EVENT WEIGHTS
 # ==========================================
@@ -754,36 +754,47 @@ def circuit(x, weights):
 # VQC model
 # ---------------------------
 
-class VQC(nn.Module):
+# ---------------------------
+# PURE VQC (NO CLASSICAL HEAD)
+# ---------------------------
+
+class PureVQC(nn.Module):
 
     def __init__(self):
 
         super().__init__()
 
+        # variational quantum parameters
         self.weights = nn.Parameter(
-            0.01 * torch.randn((7, n_qubits, 3))
+            0.01 * torch.randn((10, n_qubits, 3))
         )
 
-        self.readout = nn.Sequential(
-            nn.Linear(n_qubits, 8),
-            nn.Tanh(),
-            nn.Linear(8, 1)
-            )
+        # ONLY linear readout
+        # no hidden nonlinear classical network
+        self.readout = nn.Linear(
+            n_qubits,
+            1
+        )
 
     def forward(self, x):
 
+        # quantum embedding + variational circuit
         q_out = circuit(x, self.weights)
 
+        # shape: [batch, n_qubits]
         q_out = torch.stack(q_out, dim=1)
 
-        # FIX: ensure same dtype as torch model
+        # ensure float32 compatibility
         q_out = q_out.float()
 
+        # single linear classifier
         logits = self.readout(q_out)
 
         return logits.squeeze()
 
-model = VQC()
+
+model = PureVQC()
+
 
 
 # ---------------------------
@@ -883,7 +894,7 @@ np.save(
     scores_vqc
 )
 np.save( SAVE_PATH + "scores_vqc_pennylane_hadronic_resolved_train.npy", scores_vqc_train)
-print("Saved → scores_vqc_pennylane.npy")
+print("Saved → scores_vqc_pennylane.npy")'''
 
 
 #%%
@@ -1591,3 +1602,449 @@ def plot_significance_region(scores_dict, Y, W, region):
 
 plot_significance_region(scores_dict, Yte, Wte, Rte.flatten())
 #%%
+# ==========================================================
+# CALIBRATION-INDEPENDENT MODEL COMPARISON
+# Significance vs Signal Efficiency
+# ==========================================================
+
+from sklearn.metrics import roc_curve
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ----------------------------------------------------------
+# Core calculation
+# ----------------------------------------------------------
+
+def significance_vs_efficiency(scores, Y, W):
+
+    # weighted ROC
+    fpr, tpr, thresholds = roc_curve(
+        Y,
+        scores,
+        sample_weight=np.abs(W)
+    )
+
+    epsS = tpr
+    epsB = fpr
+
+    # weighted total yields
+    S0 = np.sum(W[Y == 1])
+    B0 = np.sum(W[Y == 0])
+
+    S = epsS * S0
+    B = epsB * B0
+
+    Z = np.divide(
+        S,
+        np.sqrt(B),
+        out=np.zeros_like(S),
+        where=(B > 0)
+    )
+
+    return epsS, epsB, Z
+
+
+# ----------------------------------------------------------
+# Metric extraction
+# ----------------------------------------------------------
+
+def significance_metrics(scores, Y, W):
+
+    epsS, epsB, Z = significance_vs_efficiency(
+        scores, Y, W
+    )
+
+    imax = np.argmax(Z)
+
+    Zmax = Z[imax]
+
+    epsS_star = epsS[imax]
+    epsB_star = epsB[imax]
+
+    rejection = (
+        1 / epsB_star
+        if epsB_star > 0
+        else np.inf
+    )
+
+    # --------------------------------------
+    # baseline significance
+    # --------------------------------------
+    S0 = np.sum(W[Y == 1])
+    B0 = np.sum(W[Y == 0])
+
+    Z_baseline = (
+        S0 / np.sqrt(B0)
+        if B0 > 0 else 0
+    )
+
+    gain = (
+        Zmax / Z_baseline
+        if Z_baseline > 0
+        else 0
+    )
+
+    # --------------------------------------
+    # robustness width (95%)
+    # --------------------------------------
+    mask95 = Z >= (0.95 * Zmax)
+
+    if np.any(mask95):
+        width95 = (
+            np.max(epsS[mask95])
+            -
+            np.min(epsS[mask95])
+        )
+    else:
+        width95 = 0
+
+    # --------------------------------------
+    # integrated significance
+    # --------------------------------------
+    areaZ = np.trapz(Z, epsS)
+
+    return {
+        "epsS": epsS,
+        "epsB": epsB,
+        "Z": Z,
+        "Zmax": Zmax,
+        "epsS_star": epsS_star,
+        "epsB_star": epsB_star,
+        "rejection": rejection,
+        "Z_baseline": Z_baseline,
+        "gain": gain,
+        "width95": width95,
+        "areaZ": areaZ
+    }
+
+
+# ----------------------------------------------------------
+# Bootstrap uncertainties
+# ----------------------------------------------------------
+
+def bootstrap_significance_metrics(
+    scores,
+    Y,
+    W,
+    n_boot=300
+):
+
+    N = len(scores)
+
+    results = []
+
+    for _ in range(n_boot):
+
+        idx = np.random.randint(0, N, N)
+
+        res = significance_metrics(
+            scores[idx],
+            Y[idx],
+            W[idx]
+        )
+
+        results.append([
+            res["Zmax"],
+            res["epsS_star"],
+            res["epsB_star"],
+            res["rejection"],
+            res["gain"],
+            res["width95"],
+            res["areaZ"]
+        ])
+
+    results = np.array(results)
+
+    names = [
+        "Zmax",
+        "epsS_star",
+        "epsB_star",
+        "rejection",
+        "gain",
+        "width95",
+        "areaZ"
+    ]
+
+    out = {}
+
+    for i, name in enumerate(names):
+
+        vals = results[:, i]
+
+        out[name] = (
+            np.mean(vals),
+            np.std(vals)
+        )
+
+    return out
+
+
+# ----------------------------------------------------------
+# Plot significance vs signal efficiency
+# ----------------------------------------------------------
+
+def plot_significance_efficiency(
+    scores_dict,
+    Y,
+    W,
+    region=None
+):
+
+    REGION_LABELS = {
+        0:"1b",
+        1:"2b",
+    }
+
+    if region is not None:
+
+        mask = (Rte.flatten() == region)
+
+        Yp = Y[mask]
+        Wp = W[mask]
+
+        title = REGION_LABELS[region]
+
+    else:
+
+        Yp = Y
+        Wp = W
+
+        title = "Inclusive"
+
+    plt.figure(figsize=(7,6))
+
+    for name, scores in scores_dict.items():
+
+        if region is not None:
+            sp = scores[mask]
+        else:
+            sp = scores
+
+        res = significance_metrics(
+            sp, Yp, Wp
+        )
+
+        plt.plot(
+            res["epsS"],
+            res["Z"],
+            linewidth=2,
+            label=name
+        )
+
+        imax = np.argmax(res["Z"])
+
+        plt.scatter(
+            res["epsS"][imax],
+            res["Z"][imax],
+            s=50
+        )
+
+    plt.xlabel("Signal efficiency")
+    plt.ylabel("Significance S / √B")
+    plt.title(
+        f"Significance vs Signal Efficiency ({title})"
+    )
+
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.show()
+
+
+# ==========================================================
+# RUN
+# ==========================================================
+
+scores_dict = {
+    "BDT": scores_bdt,
+    "MLP": scores_mlp,
+    "VQC": scores_vqc
+}
+
+# ------------------------------------------
+# Inclusive plot
+# ------------------------------------------
+plot_significance_efficiency(
+    scores_dict,
+    Yte,
+    Wte
+)
+
+# ------------------------------------------
+# Region plots
+# ------------------------------------------
+for r in [0,1]:
+
+    plot_significance_efficiency(
+        scores_dict,
+        Yte,
+        Wte,
+        region=r
+    )
+
+
+# ==========================================================
+# METRICS TABLE
+# ==========================================================
+
+print("\n==============================")
+print("CALIBRATION-INDEPENDENT METRICS")
+print("==============================")
+
+for name, scores in scores_dict.items():
+
+    metrics = bootstrap_significance_metrics(
+        scores,
+        Yte,
+        Wte
+    )
+
+    print(f"\n{name}")
+
+    print(
+        f"Zmax = "
+        f"{metrics['Zmax'][0]:.4f}"
+        f" ± "
+        f"{metrics['Zmax'][1]:.4f}"
+    )
+
+    print(
+        f"epsS* = "
+        f"{metrics['epsS_star'][0]:.4f}"
+        f" ± "
+        f"{metrics['epsS_star'][1]:.4f}"
+    )
+
+    print(
+        f"epsB* = "
+        f"{metrics['epsB_star'][0]:.4f}"
+        f" ± "
+        f"{metrics['epsB_star'][1]:.4f}"
+    )
+
+    print(
+        f"Background rejection = "
+        f"{metrics['rejection'][0]:.4f}"
+        f" ± "
+        f"{metrics['rejection'][1]:.4f}"
+    )
+
+    print(
+        f"Significance gain = "
+        f"{metrics['gain'][0]:.4f}"
+        f" ± "
+        f"{metrics['gain'][1]:.4f}"
+    )
+
+    print(
+        f"95% width = "
+        f"{metrics['width95'][0]:.4f}"
+        f" ± "
+        f"{metrics['width95'][1]:.4f}"
+    )
+
+    print(
+        f"Integrated significance = "
+        f"{metrics['areaZ'][0]:.4f}"
+        f" ± "
+        f"{metrics['areaZ'][1]:.4f}"
+    )
+#%%
+# ==========================================================
+# REGION-WISE CALIBRATION-INDEPENDENT METRICS
+# ==========================================================
+
+REGION_LABELS = {
+    0: "1b",
+    1: "2b",
+}
+
+
+def print_metrics_table(scores_dict, Y, W, R):
+
+    for region in [0, 1]:
+
+        region_name = REGION_LABELS[region]
+
+        print("\n" + "="*70)
+        print(f"PHYSICS REGION : {region_name}")
+        print("="*70)
+
+        mask = (R.flatten() == region)
+
+        Yr = Y[mask]
+        Wr = W[mask]
+
+        for model_name, scores in scores_dict.items():
+
+            Sr = scores[mask]
+
+            metrics = bootstrap_significance_metrics(
+                Sr,
+                Yr,
+                Wr,
+                n_boot=300
+            )
+
+            print(f"\n{model_name}")
+
+            print(
+                f"Zmax = "
+                f"{metrics['Zmax'][0]:.4f}"
+                f" ± "
+                f"{metrics['Zmax'][1]:.4f}"
+            )
+
+            print(
+                f"epsS* = "
+                f"{metrics['epsS_star'][0]:.4f}"
+                f" ± "
+                f"{metrics['epsS_star'][1]:.4f}"
+            )
+
+            print(
+                f"epsB* = "
+                f"{metrics['epsB_star'][0]:.4f}"
+                f" ± "
+                f"{metrics['epsB_star'][1]:.4f}"
+            )
+
+            print(
+                f"Background rejection = "
+                f"{metrics['rejection'][0]:.4f}"
+                f" ± "
+                f"{metrics['rejection'][1]:.4f}"
+            )
+
+            print(
+                f"Significance gain = "
+                f"{metrics['gain'][0]:.4f}"
+                f" ± "
+                f"{metrics['gain'][1]:.4f}"
+            )
+
+            print(
+                f"95% width = "
+                f"{metrics['width95'][0]:.4f}"
+                f" ± "
+                f"{metrics['width95'][1]:.4f}"
+            )
+
+            print(
+                f"Integrated significance = "
+                f"{metrics['areaZ'][0]:.4f}"
+                f" ± "
+                f"{metrics['areaZ'][1]:.4f}"
+            )
+
+
+# ==========================================================
+# RUN REGION-WISE ANALYSIS
+# ==========================================================
+
+print_metrics_table(
+    scores_dict,
+    Yte,
+    Wte,
+    Rte
+)
